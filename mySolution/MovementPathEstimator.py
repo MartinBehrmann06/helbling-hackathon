@@ -5,7 +5,6 @@ import torch
 from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
 
 from typing import Tuple
-
 from MovementPath import MovementPath
 
 class MovementPathEstimator:
@@ -18,7 +17,6 @@ class MovementPathEstimator:
         self.current_folder = os.path.dirname(os.path.abspath(__file__)) + os.sep
         self.calculated_movement_paths = {}
 
-        # --- Deep Learning Setup ---
         if torch.cuda.is_available():
             self.device = torch.device('cuda')
         elif torch.backends.mps.is_available():
@@ -27,18 +25,16 @@ class MovementPathEstimator:
             self.device = torch.device('cpu')
         print(f"Loading RAFT Optical Flow Model on {self.device}...")
         
-        # We use raft_small for speed. For maximum accuracy, change to raft_large and Raft_Large_Weights.
         weights = Raft_Small_Weights.DEFAULT
         self.model = raft_small(weights=weights, progress=False).to(self.device)
         self.model.eval()
         self.transforms = weights.transforms()
 
     def preprocess_image(self, img_path: str, target_size=(256, 256)) -> torch.Tensor:
-        """Loads and preps image for RAFT (expects RGB, resized, normalized tensor)."""
         img = cv2.imread(img_path)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, target_size)
-        # Convert to tensor and scale to [−1.0, 1.0] as expected by RAFT
+        
         img_tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
         img_tensor = img_tensor * 2.0 - 1.0
         return img_tensor.unsqueeze(0).to(self.device)
@@ -58,42 +54,34 @@ class MovementPathEstimator:
             
         velocities = np.zeros(num_frames, dtype=np.float64)
         
-        # RAFT resolution (must be divisible by 8)
-        # Lower size = faster, Higher size = more accurate. 256x256 is a good balance.
         H, W = 256, 256 
         cx, cy = W / 2.0, H / 2.0
 
-        # Pre-calculate radial vectors for the dense grid to calculate expansion direction
         x_grid, y_grid = np.meshgrid(np.arange(W), np.arange(H))
         rx = x_grid - cx
         ry = y_grid - cy
         
-        # Mask to ignore the dead center (infinite depth) and extreme edges
         r_dist = np.sqrt(rx**2 + ry**2)
         valid_mask = (r_dist > (W * 0.15)) & (r_dist < (W * 0.45))
 
-        # ZVU threshold (Tuned for dense flow)
         DENSE_NOISE_THRESHOLD = 0.15
 
         print(f"Processing Video {video_number} ({num_frames} frames)...")
         
         img1_batch = self.preprocess_image(os.path.join(path_to_video, frame_files[0]), (W, H))
 
-        with torch.no_grad(): # Crucial for memory management
+        with torch.no_grad():
             for i in range(1, num_frames):
                 img2_batch = self.preprocess_image(os.path.join(path_to_video, frame_files[i]), (W, H))
                 
-                # RAFT outputs a list of flow estimates, we take the final (most accurate) one
                 list_of_flows = self.model(img1_batch, img2_batch)
                 predicted_flow = list_of_flows[-1][0].cpu().numpy() # Shape: (2, H, W)
                 
                 dx = predicted_flow[0]
                 dy = predicted_flow[1]
 
-                # Dot product of flow vectors with radial vectors to find expansion/contraction
                 dot_products = dx * rx + dy * ry
                 
-                # Calculate median magnitude and direction strictly within our valid annulus mask
                 valid_dots = dot_products[valid_mask]
                 valid_dx = dx[valid_mask]
                 valid_dy = dy[valid_mask]
@@ -112,7 +100,6 @@ class MovementPathEstimator:
                 if i % 500 == 0:
                     print(f"  ...processed {i}/{num_frames} frames")
 
-        # --- 1. Integration & Smoothing ---
         kernel_size = 15
         if num_frames > kernel_size:
             padded_velocities = np.pad(velocities, (kernel_size//2, kernel_size//2), mode='edge')
@@ -120,24 +107,25 @@ class MovementPathEstimator:
         else:
             smoothed_vels = velocities
 
-        # --- 2. State Classification ---
-        # 0.15 is high enough to kill water flow noise, but low enough to capture genuine movement
         STATE_THRESHOLD = 0.15 
         states = np.zeros(num_frames, dtype=np.int8)
         states[smoothed_vels > STATE_THRESHOLD] = 1
         states[smoothed_vels < -STATE_THRESHOLD] = -1
-
-        # --- 3. The Creep-Proof Turning Point ---
-        # Integrate binary states instead of raw floating-point velocities.
-        # This completely neutralizes "water flow creep" during stalls.
-        state_path = np.cumsum(states)
-        tp_idx = int(np.argmax(state_path))
+        
+        forward_states = (states == 1).astype(int)
+        backward_states = (states == -1).astype(int)
+        
+        cum_forward = np.cumsum(forward_states)
+        total_backward = np.sum(backward_states)
+        cum_backward = np.cumsum(backward_states)
+        backward_after = total_backward - cum_backward
+        
+        split_score = cum_forward + backward_after
+        tp_idx = int(np.argmax(split_score))
         turning_point = float(tp_idx)
 
-        # --- 4. The Winch Heuristic (Constant Velocity Integration) ---
         movement_path = np.zeros(num_frames, dtype=np.float64)
 
-        # Outbound Trip
         outbound_states = states[:tp_idx+1]
         forward_frames = np.sum(outbound_states == 1)
 
@@ -152,10 +140,8 @@ class MovementPathEstimator:
                 current_pos += v_forward
             movement_path[i] = current_pos
 
-        # Lock the peak exactly to the physical channel length
         movement_path[tp_idx] = channel_length
 
-        # Inbound Trip
         inbound_states = states[tp_idx+1:]
         backward_frames = np.sum(inbound_states == -1)
 
@@ -170,36 +156,32 @@ class MovementPathEstimator:
                 current_pos -= v_backward
             movement_path[tp_idx + 1 + i] = current_pos
 
-        # --- 5. Final Output ---
         movement_path = np.clip(movement_path, 0, channel_length)
         movement_direction = states
 
-        # --- BONUS HUNTING: Drop Locations & Stall Zones ---
-        self._calculate_bonus_events(video_number, velocities, turning_point)
+        self._calculate_bonus_events(video_number, states, turning_point)
 
         return movement_path, turning_point, movement_direction
 
-    def _calculate_bonus_events(self, video_number, velocities, turning_point):
-        """Calculates and prints bonus challenge data. You can redirect this to a file if required by the hackathon."""
+    def _calculate_bonus_events(self, video_number, states, turning_point):
+        """Calculates and prints bonus challenge data based on the cleaned binary states."""
         
-        # 1. Drop Location (First sustained movement)
         drop_frame = 0
-        for i in range(len(velocities)):
-            if abs(velocities[i]) > 0.5: 
-                if np.all(np.abs(velocities[i:i+15]) > 0.1): # 15 frames of sustained movement
+        for i in range(len(states)):
+            if states[i] == 1: 
+                if np.sum(states[i:i+15] == 1) >= 10: 
                     drop_frame = i
                     break
                     
-        # 2. Stall Zones (Pauses during the forward trip)
         stall_zones = []
         in_stall = False
         stall_start = 0
 
         for i in range(drop_frame, int(turning_point)):
-            if velocities[i] == 0.0 and not in_stall:
+            if states[i] != 1 and not in_stall:
                 in_stall = True
                 stall_start = i
-            elif velocities[i] != 0.0 and in_stall:
+            elif states[i] == 1 and in_stall:
                 in_stall = False
                 stall_length = i - stall_start
                 if stall_length > 30: # Only count severe stalls (e.g., > 1 second at 30fps)
