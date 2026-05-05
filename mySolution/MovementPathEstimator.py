@@ -240,6 +240,35 @@ class MovementPathEstimator:
         print("-" * 40)
         return movement_path, turning_point, states
 
+    def _calculate_bonus_events(self, video_number, states, turning_point):
+        """Calculates and prints bonus challenge data based on the cleaned binary states."""
+        
+        drop_frame = 0
+        for i in range(len(states)):
+            if states[i] == 1: 
+                if np.sum(states[i:i+15] == 1) >= 10: 
+                    drop_frame = i
+                    break
+                    
+        stall_zones = []
+        in_stall = False
+        stall_start = 0
+
+        for i in range(drop_frame, int(turning_point)):
+            if states[i] != 1 and not in_stall:
+                in_stall = True
+                stall_start = i
+            elif states[i] == 1 and in_stall:
+                in_stall = False
+                stall_length = i - stall_start
+                if stall_length > 30: # Only count severe stalls (e.g., > 1 second at 30fps)
+                    stall_zones.append((stall_start, i))
+                    
+        print(f"--- Video {video_number} Bonus Data ---")
+        print(f"  Drop Frame: {drop_frame}")
+        print(f"  Stall Zones: {stall_zones if stall_zones else 'None detected'}")
+        print("-" * 30)
+
     # ------------------------------------------------------------------ #
     #  Framework boilerplate – you should not need to change this          #
     # ------------------------------------------------------------------ #
