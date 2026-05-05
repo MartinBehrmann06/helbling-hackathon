@@ -1,0 +1,6 @@
+frame_images*
+*videos*
+frame_images.zip
+.idea
+*__pycache__*
+*.exe
