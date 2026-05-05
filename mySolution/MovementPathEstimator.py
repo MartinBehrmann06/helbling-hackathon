@@ -19,7 +19,12 @@ class MovementPathEstimator:
         self.calculated_movement_paths = {}
 
         # --- Deep Learning Setup ---
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            self.device = torch.device('mps')
+        else:
+            self.device = torch.device('cpu')
         print(f"Loading RAFT Optical Flow Model on {self.device}...")
         
         # We use raft_small for speed. For maximum accuracy, change to raft_large and Raft_Large_Weights.
@@ -107,69 +112,67 @@ class MovementPathEstimator:
                 if i % 500 == 0:
                     print(f"  ...processed {i}/{num_frames} frames")
 
-        # --- Pipeline Smoothing & Integration (State Machine Mode) ---
-        
-        # 1. Use raw integration ONLY to find the highly-accurate turning point
+        # --- 1. Integration & Smoothing ---
         kernel_size = 15
         if num_frames > kernel_size:
             padded_velocities = np.pad(velocities, (kernel_size//2, kernel_size//2), mode='edge')
             smoothed_vels = np.convolve(padded_velocities, np.ones(kernel_size)/kernel_size, mode='valid')
         else:
             smoothed_vels = velocities
-            
-        movement_path_raw = np.cumsum(smoothed_vels)
-        tp_idx = int(np.argmax(movement_path_raw))
-        turning_point = float(tp_idx)
 
-        # 2. Strict State Classification
-        # Increase the threshold to completely kill the "water flowing" false starts
-        STATE_THRESHOLD = 0.25 
+        # --- 2. State Classification ---
+        # 0.15 is high enough to kill water flow noise, but low enough to capture genuine movement
+        STATE_THRESHOLD = 0.15 
         states = np.zeros(num_frames, dtype=np.int8)
         states[smoothed_vels > STATE_THRESHOLD] = 1
         states[smoothed_vels < -STATE_THRESHOLD] = -1
 
-        # 3. Constant-Velocity Integration (The Winch Heuristic)
+        # --- 3. The Creep-Proof Turning Point ---
+        # Integrate binary states instead of raw floating-point velocities.
+        # This completely neutralizes "water flow creep" during stalls.
+        state_path = np.cumsum(states)
+        tp_idx = int(np.argmax(state_path))
+        turning_point = float(tp_idx)
+
+        # --- 4. The Winch Heuristic (Constant Velocity Integration) ---
         movement_path = np.zeros(num_frames, dtype=np.float64)
-        
-        # --- Outbound Trip ---
+
+        # Outbound Trip
         outbound_states = states[:tp_idx+1]
         forward_frames = np.sum(outbound_states == 1)
-        
-        # Calculate the exact constant velocity per frame
+
         if forward_frames > 0:
             v_forward = channel_length / forward_frames
         else:
             v_forward = 0.0
-            
+
         current_pos = 0.0
         for i in range(tp_idx+1):
             if outbound_states[i] == 1:
                 current_pos += v_forward
             movement_path[i] = current_pos
-            
-        # Ensure the peak hits exactly channel_length
+
+        # Lock the peak exactly to the physical channel length
         movement_path[tp_idx] = channel_length
-            
-        # --- Inbound Trip ---
+
+        # Inbound Trip
         inbound_states = states[tp_idx+1:]
         backward_frames = np.sum(inbound_states == -1)
-        
+
         if backward_frames > 0:
             v_backward = channel_length / backward_frames
         else:
             v_backward = 0.0
-            
+
         current_pos = channel_length
         for i in range(len(inbound_states)):
             if inbound_states[i] == -1:
                 current_pos -= v_backward
             movement_path[tp_idx + 1 + i] = current_pos
 
-        # Safety clip to physical bounds
+        # --- 5. Final Output ---
         movement_path = np.clip(movement_path, 0, channel_length)
-        
-        # 4. Final Output Direction
-        movement_direction = states # We can directly use our cleaned states
+        movement_direction = states
 
         # --- BONUS HUNTING: Drop Locations & Stall Zones ---
         self._calculate_bonus_events(video_number, velocities, turning_point)
